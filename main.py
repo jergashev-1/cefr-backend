@@ -7,20 +7,33 @@ Ishga tushirish (lokal test uchun):
 
 Deploy qilinganda (Render.com) start command:
     uvicorn main:app --host 0.0.0.0 --port $PORT
+
+MUHIM: Render'ga quyidagi Environment Variables kerak:
+    GEMINI_API_KEY   - Writing baholash uchun (https://aistudio.google.com/apikey)
+    GROQ_API_KEY     - Speaking baholash + Whisper uchun (https://console.groq.com/keys)
 """
 
 import os
 import uuid
 import shutil
-from typing import Optional
+import logging
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+
+from rubrics import TASKS as WRITING_TASKS, get_standard_score
+from evaluator_writing import evaluate as evaluate_writing, generate_task_prompt
+
+from rubric import PART_LABELS, get_rubric, get_max_score
+from transcriber import transcribe_audio
+from evaluator_speaking import evaluate_transcript
+from vision import extract_question_from_image
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="CEFR Test API")
 
-# Frontend istalgan manzildan so'rov yubora olishi uchun (Telegram Mini App uchun kerak)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -32,47 +45,141 @@ UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
-# ---------------------------------------------------------------------------
-# TASK PROMPTLARI (hozircha shu yerda, keyinchalik bazaga ko'chirish mumkin)
-# ---------------------------------------------------------------------------
-WRITING_TASKS = {
-    "task1_1": {
-        "title": "Task 1.1",
-        "prompt": "BU YERGA TASK 1.1 MATNINI YOZING (masalan: rasmiy xat yozish topshirig'i)",
-        "time_limit_min": 20,
-    },
-    "task1_2": {
-        "title": "Task 1.2",
-        "prompt": "BU YERGA TASK 1.2 MATNINI YOZING",
-        "time_limit_min": 20,
-    },
-    "essay": {
-        "title": "Essay / Blog post",
-        "prompt": "BU YERGA ESSAY/BLOG POST MAVZUSINI YOZING",
-        "time_limit_min": 40,
-    },
-}
+@app.get("/")
+async def root():
+    return {"message": "CEFR Test API ishlayapti ✅"}
 
 
 # ---------------------------------------------------------------------------
-# TASKLARNI OLISH
+# WRITING: bo'limlar ro'yxati (statik ma'lumot, prompt bundan tashqari)
 # ---------------------------------------------------------------------------
-@app.get("/api/tasks")
-async def get_tasks():
-    """Frontend sahifa ochilganda shu yerdan barcha topshiriqlarni oladi."""
-    return WRITING_TASKS
+@app.get("/api/writing-tasks-info")
+async def writing_tasks_info():
+    """Frontend uchun: har bir task haqida statik ma'lumot (prompt'siz)."""
+    return {
+        key: {
+            "title": t["title"],
+            "target_level": t["target_level"],
+            "word_range": t["word_range"],
+            "max_score": t["max_score"],
+        }
+        for key, t in WRITING_TASKS.items()
+    }
 
 
 # ---------------------------------------------------------------------------
-# SPEAKING: audio yuklash (yozib olingan HAM, tayyor fayl HAM shu endpointga keladi)
+# WRITING: yangi, original mavzu generatsiya qilish (botdagidek, har safar yangi)
+# ---------------------------------------------------------------------------
+@app.get("/api/writing-task/{task_key}")
+async def get_writing_task(task_key: str):
+    if task_key not in WRITING_TASKS:
+        raise HTTPException(status_code=400, detail="Noto'g'ri task_key")
+
+    try:
+        prompt_text = await generate_task_prompt(task_key)
+    except Exception as e:
+        logger.exception("Writing task generatsiyasida xatolik")
+        raise HTTPException(status_code=502, detail=f"Mavzu generatsiya qilishda xatolik: {e}")
+
+    task = WRITING_TASKS[task_key]
+    return {
+        "task_key": task_key,
+        "title": task["title"],
+        "target_level": task["target_level"],
+        "word_range": task["word_range"],
+        "max_score": task["max_score"],
+        "prompt": prompt_text,
+    }
+
+
+# ---------------------------------------------------------------------------
+# WRITING: javobni baholash (matn HAM, fayl HAM qabul qilinadi)
+# ---------------------------------------------------------------------------
+@app.post("/api/submit-writing")
+async def submit_writing(
+    task_id: str = Form(...),
+    user_id: str = Form(...),
+    prompt_text: str = Form(""),          # foydalanuvchiga ko'rsatilgan aynan shu topshiriq matni
+    text: str | None = Form(None),
+    file: UploadFile | None = File(None),
+):
+    if task_id not in WRITING_TASKS:
+        raise HTTPException(status_code=400, detail="Noto'g'ri task_id")
+
+    final_text = text or ""
+
+    if file is not None:
+        ext = os.path.splitext(file.filename)[1].lower()
+        filename = f"{user_id}_{task_id}_{uuid.uuid4().hex}{ext}"
+        filepath = os.path.join(UPLOAD_DIR, filename)
+        with open(filepath, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+        final_text = extract_text_from_file(filepath, ext)
+
+    if not final_text.strip():
+        raise HTTPException(status_code=400, detail="Matn yoki fayl bo'sh")
+
+    try:
+        result = await evaluate_writing(task_id, final_text, custom_prompt=prompt_text or None)
+    except Exception as e:
+        logger.exception("Writing baholashda xatolik")
+        raise HTTPException(status_code=502, detail=f"Baholashda xatolik: {e}")
+
+    result["word_count"] = len(final_text.split())
+    result["task_title"] = WRITING_TASKS[task_id]["title"]
+    return result
+
+
+# ---------------------------------------------------------------------------
+# SPEAKING: qismlar ro'yxati
+# ---------------------------------------------------------------------------
+@app.get("/api/speaking-parts")
+async def speaking_parts():
+    return {
+        key: {"label": label, "max_score": get_max_score(key)}
+        for key, label in PART_LABELS.items()
+    }
+
+
+# ---------------------------------------------------------------------------
+# SPEAKING: savolni rasm (screenshot) orqali o'qish
+# ---------------------------------------------------------------------------
+@app.post("/api/extract-question-image")
+async def extract_question_image(image: UploadFile = File(...)):
+    ext = os.path.splitext(image.filename)[1] or ".jpg"
+    filename = f"question_{uuid.uuid4().hex}{ext}"
+    filepath = os.path.join(UPLOAD_DIR, filename)
+
+    with open(filepath, "wb") as f:
+        shutil.copyfileobj(image.file, f)
+
+    try:
+        extracted = await extract_question_from_image(filepath)
+    except Exception as e:
+        logger.exception("Rasmdan savol o'qishda xatolik")
+        raise HTTPException(status_code=502, detail=f"Rasmni o'qishda xatolik: {e}")
+    finally:
+        try:
+            os.remove(filepath)
+        except OSError:
+            pass
+
+    return {"extracted_text": extracted}
+
+
+# ---------------------------------------------------------------------------
+# SPEAKING: audio yuklash va baholash (jonli yozilgan HAM, fayl HAM)
 # ---------------------------------------------------------------------------
 @app.post("/api/submit-speaking")
 async def submit_speaking(
     audio: UploadFile = File(...),
     user_id: str = Form(...),
-    part: str = Form("part1"),  # masalan: part1, part2, part3 - CEFR speaking qismlari
+    part: str = Form("1.1"),          # "1.1" | "1.2" | "2" | "3"
+    question_text: str = Form(""),    # nomzodga berilgan savol (ixtiyoriy, mavjud bo'lsa)
 ):
-    # 1) Faylni saqlaymiz
+    if part not in PART_LABELS:
+        raise HTTPException(status_code=400, detail="Noto'g'ri part")
+
     ext = os.path.splitext(audio.filename)[1] or ".ogg"
     filename = f"{user_id}_{part}_{uuid.uuid4().hex}{ext}"
     filepath = os.path.join(UPLOAD_DIR, filename)
@@ -80,77 +187,38 @@ async def submit_speaking(
     with open(filepath, "wb") as f:
         shutil.copyfileobj(audio.file, f)
 
-    # 2) TODO: Shu yerga sizning botingizdagi mavjud logikani qo'yasiz:
-    #    a) Audio -> matn (masalan Whisper API orqali)
-    #    b) Matn -> CEFR baholash (GPT/Claude promptingiz orqali)
-    #
-    #    Masalan:
-    #    transcript = transcribe_audio(filepath)
-    #    result = evaluate_speaking_cefr(transcript, part=part)
+    try:
+        metrics = await transcribe_audio(filepath, language="en")
 
-    # Hozircha vaqtinchalik (mock) natija qaytaramiz - buni keyin almashtiramiz
-    result = {
+        if not metrics.text.strip():
+            raise HTTPException(status_code=400, detail="Audio bo'sh yoki tushunarsiz, iltimos qayta urinib ko'ring")
+
+        rubric_text = get_rubric(part)
+        report = await evaluate_transcript(
+            metrics.text,
+            rubric_text,
+            questions=question_text,
+            audio_metrics_summary=metrics.summary_uz(),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Speaking baholashda xatolik")
+        raise HTTPException(status_code=502, detail=f"Baholashda xatolik: {e}")
+    finally:
+        try:
+            os.remove(filepath)
+        except OSError:
+            pass
+
+    return {
         "status": "ok",
-        "transcript": "(bu yerda audio matnga aylantirilgan holda chiqadi)",
-        "cefr_level": "B2",
-        "feedback": "Bu vaqtinchalik test natijasi. Haqiqiy baholash logikasi hali ulanmagan.",
-        "scores": {
-            "fluency": 0,
-            "vocabulary": 0,
-            "grammar": 0,
-            "pronunciation": 0,
-        },
+        "part": part,
+        "part_label": PART_LABELS[part],
+        "transcript": metrics.text,
+        "audio_metrics_summary": metrics.summary_uz(),
+        "report": report,
     }
-
-    return result
-
-
-# ---------------------------------------------------------------------------
-# WRITING: matn HAM, fayl (docx/pdf/txt) HAM shu endpointga keladi
-# ---------------------------------------------------------------------------
-@app.post("/api/submit-writing")
-async def submit_writing(
-    task_id: str = Form(...),          # "task1_1" | "task1_2" | "essay"
-    user_id: str = Form(...),
-    text: Optional[str] = Form(None),  # to'g'ridan-to'g'ri yozilgan matn
-    file: Optional[UploadFile] = File(None),  # yuklangan fayl (docx/pdf/txt)
-):
-    if task_id not in WRITING_TASKS:
-        raise HTTPException(status_code=400, detail="Noto'g'ri task_id")
-
-    final_text = text or ""
-
-    # Agar fayl yuborilgan bo'lsa - avval saqlaymiz, keyin matnga aylantiramiz
-    if file is not None:
-        ext = os.path.splitext(file.filename)[1].lower()
-        filename = f"{user_id}_{task_id}_{uuid.uuid4().hex}{ext}"
-        filepath = os.path.join(UPLOAD_DIR, filename)
-        with open(filepath, "wb") as f:
-            shutil.copyfileobj(file.file, f)
-
-        final_text = extract_text_from_file(filepath, ext)
-
-    if not final_text.strip():
-        raise HTTPException(status_code=400, detail="Matn yoki fayl bo'sh")
-
-    # TODO: Shu yerga sizning botingizdagi mavjud Writing baholash promptini qo'yasiz
-    # result = evaluate_writing_cefr(final_text, task_id=task_id)
-
-    result = {
-        "status": "ok",
-        "task": WRITING_TASKS[task_id]["title"],
-        "word_count": len(final_text.split()),
-        "cefr_level": "B2",
-        "feedback": "Bu vaqtinchalik test natijasi. Haqiqiy baholash logikasi hali ulanmagan.",
-        "scores": {
-            "task_achievement": 0,
-            "coherence": 0,
-            "vocabulary": 0,
-            "grammar": 0,
-        },
-    }
-
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -160,21 +228,13 @@ def extract_text_from_file(filepath: str, ext: str) -> str:
     if ext == ".txt":
         with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
             return f.read()
-
     elif ext == ".docx":
-        import docx  # python-docx
+        import docx
         doc = docx.Document(filepath)
         return "\n".join(p.text for p in doc.paragraphs)
-
     elif ext == ".pdf":
         from pypdf import PdfReader
         reader = PdfReader(filepath)
         return "\n".join((page.extract_text() or "") for page in reader.pages)
-
     else:
         raise HTTPException(status_code=400, detail=f"Qo'llab-quvvatlanmaydigan fayl turi: {ext}")
-
-
-@app.get("/")
-async def root():
-    return {"message": "CEFR Test API ishlayapti ✅"}
