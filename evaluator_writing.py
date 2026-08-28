@@ -98,14 +98,24 @@ def _extract_json(raw: str) -> dict:
     raw = raw.strip()
     raw = re.sub(r"^```(json)?", "", raw).strip()
     raw = re.sub(r"```$", "", raw).strip()
+
+    decoder = json.JSONDecoder()
+
+    # Avval to'g'ridan-to'g'ri urinamiz (eng tez yo'l, aksariyat holatda ishlaydi)
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            return json.loads(raw[start:end + 1])
-        raise
+        pass
+
+    # Model JSON obyektidan keyin qo'shimcha matn/JSON qo'shib yuborgan bo'lishi
+    # mumkin ("Extra data" xatosi). raw_decode faqat BIRINCHI to'liq va to'g'ri
+    # JSON obyektini o'qib, undan keyingi hamma narsani e'tiborsiz qoldiradi.
+    start = raw.find("{")
+    if start == -1:
+        raise ValueError(f"Javobda JSON obyekti topilmadi: {raw[:200]!r}")
+
+    obj, _end_index = decoder.raw_decode(raw, start)
+    return obj
 
 
 def _get_gemini_client():
